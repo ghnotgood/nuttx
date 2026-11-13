@@ -39,14 +39,28 @@
 
 #include <nuttx/config.h>
 #include <debug.h>
-#include <nuttx/analog/adc.h>
+#include <nuttx/analog/adc.h>   /* adc_dev_s, adc_ops_s, ... */
+#include <nuttx/analog/ioctl.h> /* ANIOC_TRIGGER */
+#include <nuttx/irq.h>          /* Enter and leave critical sections. */
+#include <nuttx/wqueue.h>       /* struct work_s */
 
 #include "arm_internal.h"             /* putreg... */
 #include "hardware/kinetis_adc.h"     /* KINETIS_ADC... */
 #include "hardware/kinetis_sim.h"     /* SIM_... */
-#include "hardware/kinetis_vrefv1.h"  /* VREF_... */
 
 #if defined(CONFIG_KINETIS_ADC0) || defined(CONFIG_KINETIS_ADC1)
+
+/****************************************************************************
+ * Private Types
+ ****************************************************************************/
+
+struct kinetis_ad_priv_s
+{
+  int irq;
+  int rr; /* Result register. */
+  struct adc_callback_s const *cb;
+  struct work_s work;
+};
 
 /****************************************************************************
  * Private Function Prototypes
@@ -58,6 +72,9 @@ static int  adc_setup(struct adc_dev_s *dev);
 static void adc_shutdown(struct adc_dev_s *dev);
 static void adc_rxint(struct adc_dev_s *dev, bool enable);
 static int  adc_ioctl(struct adc_dev_s *dev, int cmd, unsigned long arg);
+
+static int  isr(int irq, void *context, void *arg);
+static void work(void *arg);
 
 /****************************************************************************
  * Private Data
@@ -74,18 +91,28 @@ static struct adc_ops_s const g_adcops =
 };
 
 #if defined(CONFIG_KINETIS_ADC0)
+static struct kinetis_ad_priv_s g_a0d_priv =
+{
+  .irq = KINETIS_IRQ_ADC0,
+  .rr  = KINETIS_ADC0_RA,
+};
 static struct adc_dev_s g_adc0_dev =
 {
   .ad_ops  = &g_adcops,
-  .ad_priv = NULL,
+  .ad_priv = &g_a0d_priv,
 };
 #endif
 
 #if defined(CONFIG_KINETIS_ADC1)
+static struct kinetis_ad_priv_s g_a1d_priv =
+{
+  .irq = KINETIS_IRQ_ADC1,
+  .rr  = KINETIS_ADC1_RA,
+};
 static struct adc_dev_s g_adc1_dev =
 {
   .ad_ops  = &g_adcops,
-  .ad_priv = NULL,
+  .ad_priv = &g_a1d_priv,
 };
 #endif
 
@@ -95,72 +122,166 @@ static struct adc_dev_s g_adc1_dev =
 
 static int adc_bind(struct adc_dev_s *dev, struct adc_callback_s const *cb)
 {
-  UNUSED(dev);
-  UNUSED(cb);
+  struct kinetis_ad_priv_s *priv = (struct kinetis_ad_priv_s *)dev->ad_priv;
+  DEBUGASSERT(NULL != priv);
 
-  awarn("Callbacks not implemented for Kinetis' ADC");
+  priv->cb = cb;
   return OK;
 }
 
 static void adc_reset(struct adc_dev_s *dev)
 {
-#if defined(CONFIG_KINETIS_ADC0)
-  if (&g_adc0_dev == dev)
-    {
-    }
-#endif /* defined(CONFIG_KINETIS_ADC0) */
-
-#if defined(CONFIG_KINETIS_ADC1)
-  if (&g_adc1_dev == dev)
-    {
-    }
-#endif /* defined(CONFIG_KINETIS_ADC1) */
+  adc_shutdown(dev);
+  adc_setup(dev);
 }
 
 static int adc_setup(struct adc_dev_s *dev)
 {
+  struct kinetis_ad_priv_s *priv = (struct kinetis_ad_priv_s *)dev->ad_priv;
+  uint32_t reg32;
+  int ret = OK;
+
 #if defined(CONFIG_KINETIS_ADC0)
   if (&g_adc0_dev == dev)
     {
+      reg32 = getreg32(KINETIS_SIM_SCGC6);
+      reg32 |= SIM_SCGC6_ADC0;
+      putreg32(reg32, KINETIS_SIM_SCGC6);
     }
-#endif /* defined(CONFIG_KINETIS_ADC0) */
+#endif
 
 #if defined(CONFIG_KINETIS_ADC1)
   if (&g_adc1_dev == dev)
     {
+      reg32 = getreg32(KINETIS_SIM_SCGC3);
+      reg32 |= SIM_SCGC3_ADC1;
+      putreg32(reg32, KINETIS_SIM_SCGC3);
     }
-#endif /* defined(CONFIG_KINETIS_ADC1) */
+#endif
+
+  ret = irq_attach(priv->irq, isr, dev);
+  return ret;
 }
 
 static void adc_shutdown(struct adc_dev_s *dev)
 {
+  uint32_t reg32;
+
 #if defined(CONFIG_KINETIS_ADC0)
   if (&g_adc0_dev == dev)
     {
+      reg32 = getreg32(KINETIS_SIM_SCGC6);
+      reg32 &= ~SIM_SCGC6_ADC0;
+      putreg32(reg32, KINETIS_SIM_SCGC6);
     }
-#endif /* defined(CONFIG_KINETIS_ADC0) */
+#endif
 
 #if defined(CONFIG_KINETIS_ADC1)
   if (&g_adc1_dev == dev)
     {
+      reg32 = getreg32(KINETIS_SIM_SCGC3);
+      reg32 &= ~SIM_SCGC3_ADC1;
+      putreg32(reg32, KINETIS_SIM_SCGC3);
     }
-#endif /* defined(CONFIG_KINETIS_ADC1) */
+#endif
 }
 
 static void adc_rxint(struct adc_dev_s *dev, bool enable)
 {
-  UNUSED(dev);
-  UNUSED(enable);
+  struct kinetis_ad_priv_s *priv = (struct kinetis_ad_priv_s *)dev->ad_priv;
+  uint32_t reg32;
 
-  awarn("Interrupts not implemented for Kinetis' ADC");
+  if (!enable)
+    {
+      up_disable_irq(priv->irq);
+    }
+
+#if defined(CONFIG_KINETIS_ADC0)
+  if (&g_adc0_dev == dev)
+    {
+      /* TODO Must be generalized before sending upstream. */
+      if (enable)
+        {
+          putreg32(ADC_SC1_AIEN | ADC_SC1_ADCH_AD16, KINETIS_ADC0_SC1A);
+        }
+      else
+        {
+          reg32 = getreg32(KINETIS_ADC0_SC1A);
+          reg32 &= ~ADC_SC1_AIEN;
+          putreg32(reg32, KINETIS_ADC0_SC1A);
+        }
+    }
+#endif /* CONFIG_KINETIS_ADC0 */
+
+#if defined(CONFIG_KINETIS_ADC1)
+  if (&g_adc1_dev == dev)
+    {
+      if (enable)
+        {
+          putreg32(ADC_SC1_AIEN | ADC_SC1_ADCH_AD16, KINETIS_ADC1_SC1A);
+        }
+      else
+        {
+          reg32 = getreg32(KINETIS_ADC1_SC1A);
+          reg32 &= ~ADC_SC1_AIEN;
+          putreg32(reg32, KINETIS_ADC1_SC1A);
+        }
+    }
+#endif /* CONFIG_KINETIS_ADC1 */
+
+  if (enable)
+    {
+      up_enable_irq(priv->irq);
+    }
 }
 
 static int adc_ioctl(struct adc_dev_s *dev, int cmd, unsigned long arg)
 {
-  UNUSED(dev);
-  UNUSED(cmd);
+  int ret = OK;
+
   UNUSED(arg);
-  return -ENOTTY;
+
+  switch (cmd)
+    {
+      case ANIOC_TRIGGER:
+        adc_rxint(dev, true);
+        break;
+
+      default:
+        awarn("%d not implemented\n", cmd);
+        ret = -ENOTTY;
+    }
+
+  return ret;
+}
+
+static int isr(int irq, void *context, void *arg)
+{
+  struct adc_dev_s *dev = (struct adc_dev_s *)arg;
+  struct kinetis_ad_priv_s *priv = (struct kinetis_ad_priv_s *)dev->ad_priv;
+  int ret = OK;
+
+  up_disable_irq(priv->irq);
+  DEBUGVERIFY(work_queue(HPWORK, &priv->work, work, dev, 0));
+
+  UNUSED(context);
+
+  return ret;
+}
+
+static void work(void *arg)
+{
+  struct adc_dev_s *dev = (struct adc_dev_s *)arg;
+  struct kinetis_ad_priv_s *priv = (struct kinetis_ad_priv_s *)dev->ad_priv;
+  int32_t reg32;
+
+  reg32 = getreg32(priv->rr);
+
+  if (NULL != priv->cb)
+    {
+      ainfo("%d: got %d from 0x%08x", priv->irq, reg32, priv->rr);
+      priv->cb->au_receive(dev, 16, reg32);
+    }
 }
 
 /****************************************************************************
